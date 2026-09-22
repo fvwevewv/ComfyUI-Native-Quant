@@ -1,104 +1,294 @@
-# ComfyUI FP8 Weight Quantization & Mixed-Precision Loaders
+# ComfyUI FP8 Weight Quantization & Native Mixed-Precision Loaders
 
-为 ComfyUI 开发的权重量化与混合精度加载节点,理论上支持所有基于Unet和DiT的模型(仅量化Linear)。提供基于原生的量化(comfy.quant_ops与comfy_kitchen)、基于 BitsAndBytes 的量化,以及使用随机舍入（Stochastic Rounding）,scale,Hadamard旋转(int8)方法降低量化损失。本节点旨在降低模型推理时的显存开销并优化访存效率。
+ComfyUI 自定义节点包，用于对 UNet / DiT 中的 `Linear` 权重进行低精度量化，并通过 ComfyUI 原生 `comfy.quant_ops`、`comfy_kitchen` 和 MixedPrecision 路径执行推理。
 
----
+已重点检查并适配的模型家族：`Flux 1`、`Flux 2`、`Qwen Image`、`Qwen Edit`、`Qwen 2.1`、`Krea`、`Krea 2`、`Lumina 2`、`Z-Image`、`Klein`，以及 `Noob1.1E` UNet、Anima。
 
-## 核心特性
+当前版本只保留两个正式 loader：
 
-- **原生混合精度加载 (Native Mixed Precision)**：基于 ComfyUI 原生 `comfy.quant_ops` 及 `comfy_kitchen` C++ / CUDA 后端，支持多精度就地量化与动态直接加载。
-- **随机舍入 (Stochastic Rounding)**：针对原生 FP8/FP4 格式实现随机舍入，通过注入确定性伪随机噪声降低量化带来的精度损失，在极低精度下维持原有模型的细节还原度。
-- **哈达玛旋转 (Hadamard Transform)**：针对 INT8 (W8A16) 精度实现正交变换，通过打散权重与激活值中的通道极值（Outliers），抑制量化导致的偏色与噪声，提高量化后模型的数值稳定性。
-- **敏感层保护机制**：自动检测并旁路（Bypass）`adaln`、`modulation`、`norm`、`embed` 以及部分早期敏感网络层（如 Safe Blocks），避免敏感参数被过度量化导致推理异常。
-- **UNet 内存排布优化**：针对标准 UNet 架构自动启用 `channels_last` (NHWC) 排布，减少访存带宽开销并提升张量计算效率。
+- `FP8 Checkpoint Loader`
+- `INT8 Checkpoint Loader`
 
----
+节点不会量化文本编码器或 VAE。TE/VAE 选项只决定使用 checkpoint 内置组件，还是加载指定的外部文件。
 
-## 安装方法
+## 特性概览
 
-1. 进入 ComfyUI 的自定义节点目录：
-   ```bash
-   cd ComfyUI/custom_nodes
-   ```
-2. 克隆本仓库：
-   ```bash
-   git clone https://github.com/fvwevewv/comfyui-fp8-weight-quantize.git
-   ```
-3. 重启 ComfyUI 即可。
+- ComfyUI 原生 MixedPrecision state-dict 路径。
+- FP8 E4M3、NVFP4、MXFP8、BNB NF4。
+- INT8 W8A8、INT8 ConvRot W8A8、ConvRot W4A4 INT4/INT8，以及 W4A8 `Asym_W4A8_Int8` 路径。
+- INT8 loader 支持 Comfy Kitchen CUDA / Triton backend 选择。
+- 敏感层保护、Anima 边界层保护和标准 UNet `channels_last` 优化。
+- `torch.compile` 兼容模式。
 
-> [!NOTE]
-> - 原生 `nvfp4` 或 `mxfp8` 精度需要较新版本的 ComfyUI 且正确安装了 `comfy_kitchen` 。
-> - 使用 `bnb-nf4` 后量化需要ComfyUI已安装 `bitsandbytes` 包。
+## 节点
 
----
+### 1. FP8 Checkpoint Loader
 
-### 1. 💾 FP8 Checkpoint Loader (混合精度加载器)
+节点名：`Fp8CheckpointLoader`
 
-该节点在 Checkpoint 加载的 `state_dict` 阶段进行元数据注入与量化，量化后由 ComfyUI 原生的 `MixedPrecisionOps` 接管，从而优化运行效率。
+支持的 `dtype`：
 
-* **参数配置**：
-  - `ckpt_name`：选择需要加载的 Checkpoint 或 Diffusion 模型。
-  - `dtype` (精度选项)：
-    - `float8_e4m3fn`：原生 FP8 E4M3 精度。
-      - **Ada Lovelace (RTX 40系) 及以上显卡**：提供完整硬件级 FP8 加速计算支持。
-      - **Ampere (RTX 30系) 显卡**：**不支持硬件级 FP8 加速计算，但支持 FP8 格式的存储和读取（在推理阶段会自动转换为 FP16/BF16 进行计算，可有效节省显存但无法获得加速效益）**。
-      - **Turing (RTX 20系) 及以前显卡**：不支持此精度。
-    - `nvfp4`：ComfyUI 原生 Block-wise 4-bit 浮点格式，无需安装 bitsandbytes。
-      - **Blackwell (RTX 50系) 及以上显卡**：支持原生 nvfp4 硬件加速。
-      - **更早架构显卡**：在不支持的旧硬件上运行会退化为软件模拟反量化与计算，会降低生成图像质量并可能影响速度，非必要不建议在不支持的硬件上选择此项。
-    - `mxfp8`：ComfyUI 原生 Block-wise 8-bit 浮点格式，具备较好的数值抗噪性能。
-    - `bnb-nf4`：基于 BitsAndBytes 的 NF4 4-bit 格式。载入后自动就地量化，适用于所有 CUDA 设备以压缩显存。
-  - `stochastic_rounding` (`True` / `False`)：是否启用随机舍入。开启后将在 GPU 上进行随机噪声注入，改善低比特（FP8/FP4）量化下的暗部细节与画质。
-  - `skip_sensitive` (`True` / `False`)：敏感层保护。开启后自动保持核心骨架层为原始精度。
-  - `allow_compile` (`False` / `True`)：是否启用 `torch.compile` 兼容模式。
+| 模式 | 路径 | 说明 |
+|---|---|---|
+| `float8_e4m3fn` | Comfy 原生 MixedPrecision | 标准 FP8 E4M3；RTX 40 系及以上支持硬件加速 |
+| `nvfp4` | Comfy 原生 MixedPrecision | NVIDIA NVFP4 4-bit 浮点格式，使用 16-value micro-block 的 E4M3 scaling；RTX 50 系及以上支持原生硬件路径 |
+| `mxfp8` | Comfy 原生 MixedPrecision | MXFP8 microscaling FP8 格式 |
+| `bnb-nf4` | 加载后 BNB NF4 patch | 需要 bitsandbytes；主要用于显存压缩 |
 
----
+### 2. INT8 Checkpoint Loader
 
-### 2. INT8 Weight Quantize (INT8 权重量化器)
+节点名：`Int8CheckpointLoader`
 
-针对 **INT8 (W8A16)** 精度设计的后处理量化节点，可串联在任何模型加载器后，对模型进行动态量化改写。
+支持的 `quant_mode`：
 
-* **参数配置**：
-  - `model`：接入已加载的 MODEL。
-  - `backend` (推理后端)：
-    - `PyTorch (torch._int_mm)`：使用 PyTorch 原生的 INT8 矩阵乘法，兼容所有主流 CUDA 环境，无需安装额外库。
-    - `Triton`：使用 Triton 实现的自定义 GEMM 内核进行 INT8 乘法，推理速度更快，但需要ComfyUI安装 `triton` 并仅支持 NVIDIA GPU。
-  - `skip_sensitive` (`True` / `False`)：保护敏感层不被量化。
-  - `allow_compile` (`False` / `True`)：启用 `torch.compile` 兼容模式。
-* **技术原理（哈达玛旋转）**：
-  - **Hadamard 旋转保护**：在将权重量化为 INT8 之前，通过对权重施加哈达玛矩阵正交变换，将通道中集中的激活值极值（Outliers）均匀分布到各个维度，从而在数缓解 W8A16 量化固有的数值溢出及偏色、底噪问题。
+| 模式 | Backend | 说明 |
+|---|---|---|
+| `int8_tensorwise` | CUDA / Triton | INT8 Tensor-wise W8A8 |
+| `int8_tensorwise_convrot` | CUDA / Triton | INT8 ConvRot W8A8；满足 256 对齐时启用 ConvRot |
+| `convrot_w4a4_int4` | CUDA | ConvRot W4A4 INT4 MMA |
+| `convrot_w4a4_int8` / `asym_w4a8_int8` | CUDA / Triton* | ConvRot W4A4 INT8 MMA；`asym_w4a8_int8` 使用原生 W4A8 MixedPrecision |
 
----
+`*` W4A4 只使用 CUDA；`asym_w4a8_int8` 支持 CUDA / Triton。`asym_w4a8_int8` 使用 ComfyUI 原生 `AsymW4A8Int8Layout`。
 
-## 性能与实测数据
+## TE / VAE 选择
 
-以下为实际生成测试数据：
+两个 loader 都有 `text_encoder` 和 `vae` 两个选项：
 
-**测试配置**：测试分辨率 `1024 * 1536`，挂载 **3 个 LoRA** 并应用 **SageAttention** 优化补丁。
+1. `无需加载（AIO）`：使用 checkpoint 内置的 TE/VAE。
+2. 其他选项：从 ComfyUI 的 `text_encoders` 或 `vae` 文件夹选择外部文件。
 
-### SDXL (UNet 架构)
-- **精度模式**：`float8_e4m3fn``int8+triton`
-- **推理速度**：从 **`1.48 it/s`** 提升至 **`1.99 it/s(fp8)1.76(int8+triton)`**（推理性能最高提升约 **34.5%**）
-- **推理显存 (VRAM)**：**`5.3 GB`**
+这里的 `AIO` 是 loader 的组件选择，不是模型名称。
 
-### Anima (DiT 架构)
-- **精度模式**：`float8_e4m3fn``int8+triton`
-- **推理速度**：从 **`2.0 s/it`** 缩短至 **`1.68 s/it(fp8)1.47s/it(int8+triton)`**（推理耗时最大减少约 **23.5%**）
-- **推理显存 (VRAM)**：**`5.2 GB`**
----
+外部组件只负责加载，不进入本节点的 UNet/DiT Linear 权重量化范围。
 
-## 硬件与环境推荐
+## 安装
 
-| 条件 | 推荐配置 | 说明 |
-| :--- | :--- | :--- |
-| **PyTorch 版本** | `>= 2.1` | 原生 FP8 与 Triton 算子需要高版本 PyTorch。 |
-| **CUDA 版本** | `>= 11.8` | 确保随机舍入与 Triton 编译内核正常运行。 |
-| **NVIDIA 显卡 (FP8)** | `Ada Lovelace (RTX 40系)` 或更新 | 原生 FP8 硬件加速需要 Compute Capability >= 8.9；**Ampere (RTX 30系) 仅支持 FP8 存储与加载（运行时会转换为 FP16/BF16 计算），无硬件加速。** |
-| **NVIDIA 显卡 (nvfp4)** | `Blackwell (RTX 50系)` 或更新 | 原生 nvfp4 硬件加速仅 Blackwell 架构支持；旧架构显卡运行会退化为软件模拟反量化，从而显著降低生成图像的质量。 |
-| **bitsandbytes** | 仅使用 `bnb-nf4` 时需要 | 传统 4-bit 量化加速，支持主流 CUDA 设备。 |
+进入 ComfyUI 的 `custom_nodes` 目录：
 
----
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/fvwevewv/comfyui-fp8-weight-quantize.git
+```
+
+重启 ComfyUI。
+
+### 依赖
+
+- ComfyUI 0.35.0 或更新版本；具体格式能力取决于当前 `comfy.quant_ops` 和 `comfy_kitchen`。
+- `comfy_kitchen`：FP8、FP4、INT8、ConvRot 和 W4A8 原生路径需要。
+- `bitsandbytes`：仅使用 `bnb-nf4` 时需要。
+- `triton`：仅使用 INT8 loader 的 Triton backend 时需要。
+
+## 量化和路由说明
+
+### FP8 / NVFP4 / MXFP8
+
+节点在 checkpoint 的 `state_dict` 阶段完成量化，并写入 ComfyUI 当前使用的逐层 `comfy_quant` 和 scale 元数据。模型构建后由 ComfyUI MixedPrecisionOps 接管。
+
+### INT8 W8A8 / ConvRot
+
+INT8 权重会写入 ComfyUI 原生 `int8_tensorwise` 元数据。ConvRot 层额外写入：
+
+```json
+{
+  "format": "int8_tensorwise",
+  "convrot": true,
+  "convrot_groupsize": 256
+}
+```
+
+如果某个 Linear 的输入维度不满足 256 对齐，`int8_tensorwise_convrot` 会对该层退回普通 INT8，而不会强行使用错误的旋转尺寸。
+
+### ConvRot W4A4
+
+W4A4 使用 ComfyUI 原生 `convrot_w4a4` layout：
+
+- INT4 使用默认 `linear_dtype=int4`。
+- INT8 使用 `linear_dtype=int8`。
+- packed weight 会保存原始形状信息，供 ComfyUI 模型识别阶段恢复。
+- Anima DiT 的 W4A4 INT4/INT8 默认主动禁用，因为实测会产生严重雪花、糊化或结构失真。
+
+### `Asym_W4A8_Int8`
+
+W4A8 使用 ComfyUI 原生 MixedPrecision state-dict 路径：
+
+```text
+量化权重
+  -> asym_w4a8_int8 comfy_quant
+  -> packed INT4 weight
+  -> weight_s_rel
+  -> weight_s_channel
+  -> AsymW4A8Int8Layout
+  -> Comfy Kitchen CUDA / Triton
+```
+
+对于 ConvRot group 64/16，当前 CUDA 旋转 fused kernel 有 group 256 限制，因此量化准备阶段使用 Comfy Kitchen eager；推理仍然保留原生 MixedPrecision Tensor。group 256 使用 CUDA，Triton 路径使用 Triton。
+
+## 敏感层保护
+
+默认 `skip_sensitive=True`。节点会跳过或保护以下类型的层：
+
+- AdaLN、modulation、`img_mod`、`txt_mod`。
+- norm、embed、输入投影和输出投影。
+- time、vector、guidance 等条件嵌入。
+- Krea、Lumina、Z-Image 等架构中的已知敏感组件。
+- Anima 的首尾 block、早期 MLP 和非目标 attention projection。
+
+保护规则的目标是避免用量化速度换取不可接受的结构性质量损失。
+
+## 性能测试
+
+以下测试在 RTX 4070 Laptop GPU 上完成：
+
+| 项目 | 值 |
+|---|---|
+| ComfyUI | 0.37.0 |
+| PyTorch | 2.13.0+cu130 |
+| comfy-kitchen | 0.2.35 |
+| Triton | 3.7.1 |
+| Attention | SageAttention |
+| 分辨率 | 1024×1536 |
+| Steps | 30 |
+| CFG | 5.0 |
+| Sampler | `dpmpp_3m_sde_gpu` |
+| Scheduler | `sgm_uniform` |
+| Seed | 424242 |
+
+PSNR/SSIM 相对于同模型、同参数的 baseline PNG 计算。平均每步是 30 steps 中的 step 间隔平均值。
+
+### Anima / DiT
+
+Baseline：1455.36 ms/step。
+
+| 模式 | Backend | 平均每步 | 相对速度 | PSNR | SSIM |
+|---|---|---:|---:|---:|---:|
+| FP8 E4M3 | CUDA | 1091.97 ms | +24.97% | 19.37 dB | 0.8170 |
+| NVFP4 | CUDA | 1475.33 ms | -1.37% | 13.15 dB | 0.6645 |
+| MXFP8 | CUDA | 1592.97 ms | -9.46% | 20.56 dB | 0.8457 |
+| BNB NF4 | CUDA | 1473.99 ms | -1.28% | 15.45 dB | 0.7152 |
+| INT8 Tensor-wise | CUDA | 1112.35 ms | +23.57% | 22.03 dB | 0.8604 |
+| INT8 Tensor-wise | Triton | 1181.75 ms | +18.80% | 22.18 dB | 0.8474 |
+| INT8 ConvRot | CUDA | 1034.54 ms | +28.91% | 23.02 dB | 0.8796 |
+| INT8 ConvRot | Triton | 1084.51 ms | +25.48% | 23.90 dB | 0.9007 |
+| `asym_w4a8_int8` | CUDA | 1017.59 ms | +30.08% | 12.01 dB | 0.6408 |
+| `asym_w4a8_int8` | Triton | 1113.37 ms | +23.50% | 11.91 dB | 0.6445 |
+
+Anima 上速度/质量平衡最好的路径是 INT8 ConvRot。W4A8 CUDA 速度最高，但图像质量明显低于普通 INT8 和 ConvRot。
+
+### Noob1.1E / UNet
+
+Baseline：684.65 ms/step。
+
+| 模式 | Backend | 平均每步 | 相对速度 | PSNR | SSIM |
+|---|---|---:|---:|---:|---:|
+| FP8 E4M3 | CUDA | 524.81 ms | +23.35% | 11.27 dB | 0.4336 |
+| NVFP4 | CUDA | 681.03 ms | +0.53% | 9.92 dB | 0.3730 |
+| MXFP8 | CUDA | 798.43 ms | -16.62% | 11.29 dB | 0.4370 |
+| BNB NF4 | CUDA | 1121.83 ms | -63.85% | 9.43 dB | 0.3719 |
+| INT8 Tensor-wise | CUDA | 454.42 ms | +33.63% | 11.83 dB | 0.4697 |
+| INT8 Tensor-wise | Triton | 460.05 ms | +32.81% | 11.42 dB | 0.4459 |
+| INT8 ConvRot | CUDA | 465.30 ms | +32.04% | 11.44 dB | 0.4482 |
+| INT8 ConvRot | Triton | 515.33 ms | +24.73% | 12.39 dB | 0.5000 |
+| ConvRot W4A4 INT4 | CUDA | 434.36 ms | +36.56% | 9.02 dB | 0.2975 |
+| ConvRot W4A4 INT8 | CUDA | 530.16 ms | +22.56% | 9.76 dB | 0.3414 |
+| `asym_w4a8_int8` | CUDA | 716.28 ms | -4.62% | 10.44 dB | 0.3890 |
+| `asym_w4a8_int8` | Triton | 538.97 ms | +21.28% | 10.42 dB | 0.3862 |
+
+### 注意：
+
+在本次固定环境下，INT8 ConvRot 的 CUDA 比 Triton 更快，但 Triton 的 PSNR/SSIM 略高：
+
+| 模型 | CUDA | Triton | 观察 |
+|---|---:|---:|---|
+| Anima INT8 ConvRot | 1034.54 ms/step，23.02 dB，0.8796 | 1084.51 ms/step，23.90 dB，0.9007 | CUDA 快约 4.6%，Triton 质量指标略高 |
+| Noob1.1E INT8 ConvRot | 465.30 ms/step，11.44 dB，0.4482 | 515.33 ms/step，12.39 dB，0.5000 | CUDA 快约 9.7%，Triton 质量指标略高 |
+
+这不是 CUDA 或 Triton 的普遍理论结论。实际结果会受到模型架构、矩阵形状、显存调度、kernel 融合方式、累加顺序和量化舍入误差影响。选择 backend 时，建议使用自己的模型和工作负载进行实测。
+
+## 测试图片
+
+以下图片来自同一组固定参数测试。每个区块中的两张图片并排展示，便于比较模型架构和 backend 差异。
+
+### 1. Baseline
+
+<table>
+<tr>
+<td><img src="assets/test/20260922/anima-baseline.png" width="420" /></td>
+<td><img src="assets/test/20260922/aio-baseline.png" width="420" /></td>
+</tr>
+<tr>
+<td align="center">Anima Baseline</td>
+<td align="center">Noob1.1E Baseline</td>
+</tr>
+</table>
+
+### 2. FP8 E4M3
+
+<table>
+<tr>
+<td><img src="assets/test/20260922/anima-fp8-e4m3fn.png" width="420" /></td>
+<td><img src="assets/test/20260922/aio-fp8-e4m3fn.png" width="420" /></td>
+</tr>
+<tr>
+<td align="center">Anima · FP8 E4M3 · CUDA</td>
+<td align="center">Noob1.1E · FP8 E4M3 · CUDA</td>
+</tr>
+</table>
+
+### 3. INT8 ConvRot · CUDA
+
+<table>
+<tr>
+<td><img src="assets/test/20260922/anima-int8-convrot-cuda.png" width="420" /></td>
+<td><img src="assets/test/20260922/aio-int8-convrot-cuda.png" width="420" /></td>
+</tr>
+<tr>
+<td align="center">Anima · INT8 ConvRot · CUDA</td>
+<td align="center">Noob1.1E · INT8 ConvRot · CUDA</td>
+</tr>
+</table>
+
+### 4. INT8 ConvRot · Triton
+
+<table>
+<tr>
+<td><img src="assets/test/20260922/anima-int8-convrot-triton.png" width="420" /></td>
+<td><img src="assets/test/20260922/aio-int8-convrot-triton.png" width="420" /></td>
+</tr>
+<tr>
+<td align="center">Anima · INT8 ConvRot · Triton</td>
+<td align="center">Noob1.1E · INT8 ConvRot · Triton</td>
+</tr>
+</table>
+
+完整原始测试数据：[full-test-report.json](assets/test/20260922/full-test-report.json)
+
+## 已知限制
+
+- 本节点只量化模型中的 2D `Linear` 权重，不量化 TE 或 VAE。
+- Anima 的 ConvRot W4A4 INT4/INT8 会被主动拒绝，以避免已知严重失真。
+- W4A4 的 Triton backend 当前不可用。
+- NVFP4 的硬件级加速依赖 Blackwell 或更新架构；旧架构可能退化为软件路径。
+- BNB NF4 主要用于显存压缩，不保证带来推理速度提升。
+- CUDA/Triton 的实际速度和输出差异依赖模型、shape、PyTorch、ComfyUI 和 comfy-kitchen 版本。
+- 测试图像仅用于展示本次固定环境结果，不代表所有模型和硬件的保证值。
+
+## 项目结构
+
+```text
+comfyui-fp8-weight-quantize/
+├── __init__.py
+├── fp8_quantize_node.py
+├── assets/
+│   └── test/20260922/
+│       ├── full-test-report.json
+│       └── test images
+├── LICENSE
+└── README.md
+```
+
+当前版本使用 ComfyUI 原生 MixedPrecision 和 Comfy Kitchen，不再保留独立的自定义 Triton backend、Hadamard 旋转文件或第三个后处理量化节点。
 
 ## 许可
 
-本插件遵循 **GPL-3.0 license** 开源许可。部分实现与算法设计参考了 ComfyUI 官方、BitsAndBytes 项目与 Webui Forge。
+本项目使用 GPL-3.0 license。部分实现和算法设计参考 ComfyUI、comfy-kitchen、bitsandbytes 以及相关开源项目。
