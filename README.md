@@ -67,7 +67,7 @@ ComfyUI 自定义节点包，用于对 UNet / DiT 中的 `Linear` 权重进行�
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/fvwevewv/comfyui-fp8-weight-quantize.git
+git clone https://github.com/fvwevewv/ComfyUI-Native-Quant.git
 ```
 
 重启 ComfyUI。
@@ -205,64 +205,6 @@ Baseline：684.65 ms/step。
 
 这不是 CUDA 或 Triton 的普遍理论结论。实际结果会受到模型架构、矩阵形状、显存调度、kernel 融合方式、累加顺序和量化舍入误差影响。选择 backend 时，建议使用自己的模型和工作负载进行实测。
 
-## 测试图片
-
-以下图片来自同一组固定参数测试。每个区块中的两张图片并排展示，便于比较模型架构和 backend 差异。
-
-### 1. Baseline
-
-<table>
-<tr>
-<td><img src="assets/test/20260922/anima-baseline.png" width="420" /></td>
-<td><img src="assets/test/20260922/aio-baseline.png" width="420" /></td>
-</tr>
-<tr>
-<td align="center">Anima Baseline</td>
-<td align="center">Noob1.1E Baseline</td>
-</tr>
-</table>
-
-### 2. FP8 E4M3
-
-<table>
-<tr>
-<td><img src="assets/test/20260922/anima-fp8-e4m3fn.png" width="420" /></td>
-<td><img src="assets/test/20260922/aio-fp8-e4m3fn.png" width="420" /></td>
-</tr>
-<tr>
-<td align="center">Anima · FP8 E4M3 · CUDA</td>
-<td align="center">Noob1.1E · FP8 E4M3 · CUDA</td>
-</tr>
-</table>
-
-### 3. INT8 ConvRot · CUDA
-
-<table>
-<tr>
-<td><img src="assets/test/20260922/anima-int8-convrot-cuda.png" width="420" /></td>
-<td><img src="assets/test/20260922/aio-int8-convrot-cuda.png" width="420" /></td>
-</tr>
-<tr>
-<td align="center">Anima · INT8 ConvRot · CUDA</td>
-<td align="center">Noob1.1E · INT8 ConvRot · CUDA</td>
-</tr>
-</table>
-
-### 4. INT8 ConvRot · Triton
-
-<table>
-<tr>
-<td><img src="assets/test/20260922/anima-int8-convrot-triton.png" width="420" /></td>
-<td><img src="assets/test/20260922/aio-int8-convrot-triton.png" width="420" /></td>
-</tr>
-<tr>
-<td align="center">Anima · INT8 ConvRot · Triton</td>
-<td align="center">Noob1.1E · INT8 ConvRot · Triton</td>
-</tr>
-</table>
-
-完整原始测试数据：[full-test-report.json](assets/test/20260922/full-test-report.json)
-
 ## 已知限制
 
 - 本节点只量化模型中的 2D `Linear` 权重，不量化 TE 或 VAE。
@@ -276,13 +218,9 @@ Baseline：684.65 ms/step。
 ## 项目结构
 
 ```text
-comfyui-fp8-weight-quantize/
+ComfyUI-Native-Quant/
 ├── __init__.py
 ├── fp8_quantize_node.py
-├── assets/
-│   └── test/20260922/
-│       ├── full-test-report.json
-│       └── test images
 ├── LICENSE
 └── README.md
 ```

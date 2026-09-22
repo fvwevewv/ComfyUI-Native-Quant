@@ -803,7 +803,7 @@ class Fp8CheckpointLoader:
     FUNCTION = "load_checkpoint"
     CATEGORY = "loaders"
     DESCRIPTION = (
-        "[Comfy Native Quantized Loader] 加载 Checkpoint 并写入 Comfy 每层量化元数据。\n\n"
+        "[FP8 Checkpoint Loader] 加载 Checkpoint 并写入 Comfy 每层量化元数据。\n\n"
         "支持精度选项：\n"
         "  - float8_e4m3fn — 原生 FP8 E4M3 精度，具备原生硬件加速 (Ampere+ 架构推荐)。\n"
         "  - nvfp4 — ComfyUI 原生 Block-wise 4-bit 浮点格式 (无需 bitsandbytes)。\n"
